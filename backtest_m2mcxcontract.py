@@ -512,10 +512,15 @@ def _is_rate_msg(msg):
     return 'access rate' in m or 'exceeding' in m or 'too many' in m or 'rate limit' in m
 
 
+RATE_WAITS = (3, 6, 10, 15, 20, 30)      # seconds to wait before each retry when Angel says 'exceeding access rate' (~85 s in all)
+
+
 def _call_candle_api(smart, params):
     """one getCandleData call: spaced out + retried with back-off when Angel says 'exceeding access rate'."""
     last = 'candle request failed'
-    for i in range(5):
+    for i in range(len(RATE_WAITS) + 1):
+        if i:
+            time.sleep(RATE_WAITS[i - 1])
         with _RATE_LOCK:
             wait = MIN_GAP - (time.time() - _LAST_CALL[0])
             if wait > 0:
@@ -526,14 +531,12 @@ def _call_candle_api(smart, params):
         except Exception as e:
             last = str(e)
             if _is_rate_msg(last):
-                time.sleep(2 * (i + 1))
                 continue
             raise
         if res and res.get('status'):
             return res
         last = (res or {}).get('message', 'candle request failed')
         if _is_rate_msg(last):
-            time.sleep(2 * (i + 1))
             continue
         raise ValueError(last)
     raise ValueError(f'Angel rate limit: {last}')
@@ -572,7 +575,9 @@ def fetch_candles(smart, exchange, symbol, tf, start_day, end_day, token=None):
     token = token or _instrument_token(exchange, symbol)
     df = _fetch_range(smart, exchange, token, interval, pd.Timestamp(start_day) - pd.Timedelta(days=warm_days), backtest_end(end_day))
     if df.empty:
-        raise ValueError('no candles returned for this date range')
+        raise ValueError('no candles returned for this date range' +
+                         (' (MCX: Angel One has candles only from the day this contract started trading - use a later From date)'
+                          if exchange == 'MCX' else ''))
     return df.drop_duplicates('Date', keep='last').sort_values('Date').reset_index(drop=True)
 
 
@@ -611,10 +616,42 @@ def _with_relogin(S, creds, fn):
         return fn(_shared_smart(S, creds, stale=smart))           # session expired? log in again once
 
 
+def _candle_cache_file(key):
+    return os.path.join(STRAT_ROOT, '_candle_cache', re.sub(r'[^A-Za-z0-9_.\-]', '_', '_'.join(map(str, key))) + '.pkl')
+
+
+def _read_candle_cache(key):
+    """candles of a FINISHED range (To date before today) are kept on disk: a repeat run needs no Angel request at all."""
+    try:
+        path = _candle_cache_file(key)
+        if os.path.exists(path):
+            df = pd.read_pickle(path)
+            if list(df.columns) == ['Date', 'Open', 'High', 'Low', 'Close'] and len(df):
+                return df
+    except Exception:
+        pass
+    return None
+
+
+def _write_candle_cache(key, df):
+    try:
+        if pd.Timestamp(key[4]).date() >= now_ist().date():        # range still growing -> never cache
+            return
+        path = _candle_cache_file(key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df.to_pickle(path + '.tmp')
+        os.replace(path + '.tmp', path)
+    except Exception:
+        pass
+
+
 def _bg_full(S, key, token, creds):
     exchange, symbol, tf, start_day, end_day = key
     try:
-        df = _with_relogin(S, creds, lambda sm: fetch_candles(sm, exchange, symbol, tf, start_day, end_day, token))
+        df = _read_candle_cache(key)
+        if df is None:
+            df = _with_relogin(S, creds, lambda sm: fetch_candles(sm, exchange, symbol, tf, start_day, end_day, token))
+            _write_candle_cache(key, df)
         with S['lock']:
             S['data'][key] = {'df': df, 'checked': time.time(), 'error': None}
             S['fail'].pop(key, None)
@@ -1319,18 +1356,18 @@ def page_builder():
                             contracts.append(sym_)
                             if i_ == 0:
                                 nearest.append(sym_)                  # default tick = nearest expiry of each commodity
+                picked = list(nearest)                                    # no contract to choose: the nearest running future of each commodity
                 with cols[2]:
-                    lbl(f'Contracts ({len(contracts)})')
-                    if contracts:
-                        picked = checkbox_dropdown('Select contracts', contracts, nearest, 'mcx_con',
-                                                   fmt=lambda x: f'{x}  ({exp_of[x]:%d %b %Y})')
-                    else:
-                        picked = []
-                        st.popover('Choose a commodity first', width='stretch', disabled=True)
+                    lbl('Contract')
+                    st.caption('Automatic - ' + ('nearest running future of each commodity: ' + ', '.join(nearest) if nearest
+                                                  else 'choose a commodity first'))
                 with cols[3]:
                     lbl('Or type names (comma separated)')
-                    typed_txt = st.text_input('Or type names', label_visibility='collapsed', placeholder='GOLDM05DEC25FUT',
-                                              help='MCX: exact future symbol. Typed names are added to the ticked ones.')
+                    typed_txt = st.text_input('Or type names', label_visibility='collapsed', placeholder='(optional) exact future symbol',
+                                              help='Optional. MCX: exact future symbol of a contract that is still running in Angel One. '
+                                                   'Typed names are added to the commodities picked on the left.')
+                st.caption('MCX note: Angel One gives candles only for futures that are still running, starting from the day each contract began '
+                           'trading - there is no continuous or expired-contract history, so an older From date simply has no data.')
             else:
                 idx_opts = instrument_choices(exchange).get('Index', [])
                 cols = st.columns(3)                                  # Index | its stocks | type names
@@ -1520,6 +1557,10 @@ def page_builder():
                     if not ok_:                                     # every file failed - stay here and show why
                         errs_ = [r_['err'] for fn_, _ in to_run for r_ in [store_.get((fname, fn_), {})] if 'err' in r_]
                         st.error(f"Backtest failed: {errs_[0] if errs_ else 'no result'}")
+                        if errs_ and _is_rate_msg(errs_[0]):
+                            st.info('Your files ARE saved. Angel One is limiting requests for this API key (the limit is shared with any other app or tab '
+                                    'using the same key). Wait 1-2 minutes, then open My Backtests and press Run backtest - candles that were '
+                                    'already downloaded are not requested again.')
                         return
                     best_ = max(ok_, key=lambda t: t[1])[0]         # open the results page (graph, signals, trades) of the best file
                     st.session_state['page'] = 'strategies'
@@ -2274,15 +2315,15 @@ def main():
         st.subheader('Enter your Angel One details')
         st.caption('Only used to download historical candles. No order is ever placed.')
         api_key = st.text_input('API key', type='password')
-        client_id = st.text_input('Client ID')
+        cid_in = st.text_input('Client ID')
         mpin = st.text_input('MPIN', type='password')
         totp = st.text_input('TOTP secret key', type='password',
                              help='The long text shown when you enable TOTP (not the 6-digit code)')
         remember = st.checkbox('Remember this login', value=True,
                                help='Saves these details on the machine running this app, so next time you only press "Continue".')
         c1, c2 = st.columns([1, 4])
-        if c1.button('Login') and api_key and client_id and mpin and totp:
-            err = try_login({'api_key': api_key.strip(), 'client_id': client_id.strip().upper(),
+        if c1.button('Login') and api_key and cid_in and mpin and totp:
+            err = try_login({'api_key': api_key.strip(), 'client_id': cid_in.strip().upper(),
                              'mpin': mpin.strip(), 'totp': totp.strip()}, remember=remember)
             if err is None:
                 st.session_state.pop('new_login', None)
