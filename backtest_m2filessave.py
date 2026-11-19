@@ -2181,23 +2181,32 @@ def forget_saved_login():
 #   totp      = "..."
 #   label     = "Demo ID"        # optional - the text on the button
 def demo_creds():
+    """-> (creds or None, problem text or '')"""
     try:
-        d = dict(st.secrets.get('DEMO_LOGIN') or {})
+        sec = st.secrets.get('DEMO_LOGIN')
+    except Exception as e:
+        return None, f'secrets could not be read ({e})'
+    if not sec:
+        return None, 'no [DEMO_LOGIN] section found in secrets (save it, then reboot the app)'
+    try:
+        d = {str(k).strip().lower(): v for k, v in dict(sec).items()}
     except Exception:
-        return None
-    if all(d.get(k) for k in ('api_key', 'client_id', 'mpin', 'totp')):
-        return {'api_key': str(d['api_key']).strip(), 'client_id': str(d['client_id']).strip().upper(),
-                'mpin': str(d['mpin']).strip(), 'totp': str(d['totp']).strip(), 'demo': True,
-                'label': str(d.get('label') or 'Demo ID')}
-    return None
+        return None, '[DEMO_LOGIN] is not a section - write the header line [DEMO_LOGIN] first, then the 4 lines under it'
+    miss = [k for k in ('api_key', 'client_id', 'mpin', 'totp') if not str(d.get(k) or '').strip()]
+    if miss:
+        return None, 'DEMO_LOGIN is missing: ' + ', '.join(miss) + ' (names must be exactly api_key, client_id, mpin, totp)'
+    return {'api_key': str(d['api_key']).strip(), 'client_id': str(d['client_id']).strip().upper(),
+            'mpin': str(d['mpin']).strip(), 'totp': str(d['totp']).strip(), 'demo': True,
+            'label': str(d.get('label') or 'Demo ID')}, ''
 
 
 def demo_login_button(key):
-    """shows the 'Demo ID' button (if configured); returns the error text if the demo login failed, else None."""
-    d = demo_creds()
-    if not d:
-        return None
+    """shows the 'Demo ID' button; returns the error text if the demo login failed, else None."""
+    d, problem = demo_creds()
     st.divider()
+    if not d:
+        st.caption(f'Demo ID not available: {problem}')       # tells the owner exactly what is wrong
+        return None
     st.caption('No Angel One account? Try the app with the demo ID - no keys needed.')
     if st.button(f"🎯 {d['label']}  (click to login)", key=key, width='stretch'):
         err = try_login(d, remember=False)              # never saved to .saved_logins.json
