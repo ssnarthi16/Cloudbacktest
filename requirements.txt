@@ -1,0 +1,9 @@
+streamlit==1.66.1
+pandas
+numpy
+requests
+smartapi-python
+pyotp
+logzero
+websocket-client
+pycryptodome
